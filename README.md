@@ -13,7 +13,7 @@ the same session, a small router is needed in front. Existing routers
 Python projects with many dependencies — overkill, and an audit burden when
 you care about not leaking your Claude Pro OAuth token.
 
-This proxy is **one file, stdlib only**, ~150 lines. Audit it yourself.
+This proxy is **one file, stdlib only**, ~230 lines. Audit it yourself.
 
 ## Routing
 
@@ -54,6 +54,28 @@ Inside Claude Code, use `/model <name>` to switch:
 - `/model claude-sonnet-4-6` → goes to Anthropic
 - `/model qwen3.6-35b-a3b-UD-Q5_K_XL-ctx200k` → goes to llama.cpp
 
+## Cross-provider switching: thinking blocks
+
+When you switch from a local model to an Anthropic model mid-session,
+Claude Code resends the full conversation history. Anthropic validates
+the cryptographic signature of any `thinking` block in that history;
+blocks produced by another provider (llama.cpp emits them for reasoning
+models like qwen3) fail validation and the request is rejected:
+
+```
+API Error: 400 messages.N.content.0: Invalid `signature` in `thinking` block
+```
+
+To make in-session switching usable, the proxy **strips `thinking` and
+`redacted_thinking` blocks from message history before forwarding to
+Anthropic**. The user-visible text of prior assistant turns is preserved;
+only the reasoning trace is dropped (it could not have transferred
+meaningfully across providers anyway).
+
+This is the **only** body modification the proxy performs. Requests bound
+for the local backend — and Anthropic-bound requests that don't contain
+foreign thinking blocks — are byte-for-byte pass-through.
+
 ## Security properties
 
 - **Bind:** only `127.0.0.1` by default (never accept external connections).
@@ -64,6 +86,10 @@ Inside Claude Code, use `/model <name>` to switch:
 - **No body logging:** request and response bodies are never written to
   disk or stderr. Only metadata is logged: method, path, target label,
   and the model name extracted from the body (which the user typed).
+- **Bodies are not modified**, with one documented exception: for
+  requests routed to Anthropic, `thinking` / `redacted_thinking` content
+  blocks are removed from `messages[].content[]` (see "Cross-provider
+  switching" above). No other field is touched.
 - **No telemetry, no phone-home.** The proxy talks only to the two
   destinations you configured.
 - **Hop-by-hop headers stripped** per RFC 7230 (`Connection`, `Keep-Alive`,
