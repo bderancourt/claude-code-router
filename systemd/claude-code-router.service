@@ -1,0 +1,35 @@
+[Unit]
+Description=claude-code-router (Anthropic <-> llama.cpp routing proxy)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/claude-code-router/proxy.py
+Restart=on-failure
+RestartSec=2
+
+# Run as an unprivileged dynamic user; loopback-only listener so no caps needed.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Defaults; override with `systemctl edit` or an EnvironmentFile if needed.
+Environment=CCR_LISTEN_HOST=127.0.0.1
+Environment=CCR_LISTEN_PORT=8082
+Environment=CCR_LOCAL_HOST=127.0.0.1
+Environment=CCR_LOCAL_PORT=8080
+
+[Install]
+WantedBy=multi-user.target
