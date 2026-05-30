@@ -50,6 +50,47 @@ def pick_target(model):
     return LOCAL_HOST, LOCAL_PORT, False, "local"
 
 
+def sanitize_for_anthropic(body):
+    """Strip 'thinking' / 'redacted_thinking' blocks from message history.
+
+    When switching mid-conversation from a non-Anthropic model (e.g. a local
+    llama.cpp serving qwen) to an Anthropic model, the prior assistant turn
+    may contain thinking blocks whose cryptographic signatures are invalid
+    for Anthropic. Anthropic rejects the request with a 400.
+
+    Removing those blocks loses the thinking context (irrecoverable across
+    providers anyway) but preserves the user-visible text, letting the
+    conversation continue. Returns the possibly-rewritten body.
+    """
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(data, dict):
+        return body
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return body
+    changed = False
+    stripped_types = ("thinking", "redacted_thinking")
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = [
+            b for b in content
+            if not (isinstance(b, dict) and b.get("type") in stripped_types)
+        ]
+        if len(kept) != len(content):
+            msg["content"] = kept
+            changed = True
+    if not changed:
+        return body
+    return json.dumps(data).encode("utf-8")
+
+
 class RouterHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "claude-code-router/1.0"
@@ -93,6 +134,11 @@ class RouterHandler(http.server.BaseHTTPRequestHandler):
                 pass
 
         host, port, use_tls, label = pick_target(model)
+
+        # When forwarding to Anthropic, strip thinking blocks that may carry
+        # signatures invalid for this provider (e.g. from a prior local turn).
+        if label == "anthropic" and body:
+            body = sanitize_for_anthropic(body)
 
         # Build the forwarded header list (strip hop-by-hop, rewrite Host).
         fwd_headers = []
