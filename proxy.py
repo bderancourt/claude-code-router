@@ -29,6 +29,16 @@ LISTEN_PORT = int(os.environ.get("CCR_LISTEN_PORT", "8082"))
 LOCAL_HOST = os.environ.get("CCR_LOCAL_HOST", "127.0.0.1")
 LOCAL_PORT = int(os.environ.get("CCR_LOCAL_PORT", "8080"))
 
+# When set, any request routed to the local backend will have its model field
+# rewritten to this value. Useful when the client (e.g. the VSCode extension)
+# sends a hardcoded claude-* model name but you want a specific local model.
+LOCAL_MODEL_OVERRIDE = os.environ.get("CCR_LOCAL_MODEL", "")
+
+# Comma-separated substrings: if the requested model contains any of these,
+# route to the local backend instead of Anthropic. Example: "haiku" routes
+# all claude-haiku-* models locally while sonnet/opus go to Anthropic.
+LOCAL_ROUTE_PATTERNS = [s.strip() for s in os.environ.get("CCR_LOCAL_MODELS", "").split(",") if s.strip()]
+
 ANTHROPIC_HOST = os.environ.get("CCR_ANTHROPIC_HOST", "api.anthropic.com")
 ANTHROPIC_PORT = int(os.environ.get("CCR_ANTHROPIC_PORT", "443"))
 
@@ -44,7 +54,13 @@ HOP_BY_HOP = frozenset(h.lower() for h in (
 
 
 def pick_target(model):
-    """Return (host, port, use_tls, label) for the given model name."""
+    """Return (host, port, use_tls, label) for the given model name.
+
+    CCR_LOCAL_MODELS: comma-separated substrings (e.g. "haiku") that force
+    local routing. Everything else starting with "claude-" goes to Anthropic.
+    """
+    if LOCAL_ROUTE_PATTERNS and any(pat in model for pat in LOCAL_ROUTE_PATTERNS):
+        return LOCAL_HOST, LOCAL_PORT, False, "local"
     if model.startswith("claude-"):
         return ANTHROPIC_HOST, ANTHROPIC_PORT, True, "anthropic"
     return LOCAL_HOST, LOCAL_PORT, False, "local"
@@ -88,6 +104,47 @@ def sanitize_for_anthropic(body):
             changed = True
     if not changed:
         return body
+    return json.dumps(data).encode("utf-8")
+
+
+def sanitize_for_vllm(body):
+    """Fix Anthropic-format requests for vLLM's /v1/messages endpoint.
+
+    Claude Code sends system prompt as messages[0] with role='system'.
+    vLLM's Anthropic-compatible endpoint expects system as a top-level field,
+    not inside the messages array. Extract it.
+    """
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(data, dict):
+        return body
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return body
+    if LOCAL_MODEL_OVERRIDE and "model" in data:
+        data["model"] = LOCAL_MODEL_OVERRIDE
+
+    system_parts = []
+    remaining = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                system_parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        system_parts.append(block.get("text", ""))
+        else:
+            remaining.append(msg)
+    if not system_parts:
+        # Still return modified data if model was rewritten.
+        return json.dumps(data).encode("utf-8") if (LOCAL_MODEL_OVERRIDE and "model" in data) else body
+    data["messages"] = remaining
+    if "system" not in data:
+        data["system"] = "\n\n".join(system_parts)
     return json.dumps(data).encode("utf-8")
 
 
@@ -139,6 +196,11 @@ class RouterHandler(http.server.BaseHTTPRequestHandler):
         # signatures invalid for this provider (e.g. from a prior local turn).
         if label == "anthropic" and body:
             body = sanitize_for_anthropic(body)
+
+        # When forwarding to the local backend, extract system message from
+        # the messages array into the top-level system field (vLLM requirement).
+        if label == "local" and body:
+            body = sanitize_for_vllm(body)
 
         # Build the forwarded header list (strip hop-by-hop, rewrite Host).
         fwd_headers = []
